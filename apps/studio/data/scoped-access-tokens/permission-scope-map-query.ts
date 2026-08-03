@@ -28,17 +28,27 @@ export interface ScopeMapEntry {
   }
 */
 export type ScopeMap = Record<string, ScopeMapEntry>
-// e.g { 'GET /v2/projects/{ref}/analytics/log-drains': ['analytics_config_read'] }
-export type EndpointMap = Record<string, string[]>
-// e.g { 'deploy_edge_function': ['edge_functions_write'] }
-export type McpMap = Record<string, string[]>
+
+/** A set of scopes that must ALL be granted (conjunctive). */
+export type ScopeGroup = string[]
+/**
+ * Alternative scope groups, mirroring the mgmt-api `x-fga-permissions` semantics: a token
+ * satisfies the requirement when it holds ALL scopes of at least ONE group (OR between groups,
+ * AND within a group) — see `AuthWithFgaPermissions` in the mgmt-api.
+ */
+export type ScopeGroupAlternatives = ScopeGroup[]
+
+// e.g { 'GET /v1/projects/{ref}/branches': [['branching_development_read'], ['branching_production_read']] }
+export type EndpointMap = Record<string, ScopeGroupAlternatives>
+// e.g { 'deploy_edge_function': [['edge_functions_write']] }
+export type McpMap = Record<string, ScopeGroupAlternatives>
 
 export interface PermissionScopeMap {
   /** scope id -> the endpoints / MCP tools it (partially) authorizes */
   scopes: ScopeMap
-  /** endpoint -> ALL scopes it requires (conjunctive) */
+  /** endpoint -> alternative scope groups (OR between groups, AND within a group) */
   endpoints: EndpointMap
-  /** MCP tool -> ALL scopes it requires (conjunctive) */
+  /** MCP tool -> alternative scope groups (OR between groups, AND within a group) */
   mcp_tools: McpMap
 }
 
@@ -57,10 +67,17 @@ const splitEndpoint = (raw: string): EnabledEndpoint => {
   return { method: raw.slice(0, spaceIndex), path: raw.slice(spaceIndex + 1), raw }
 }
 
+// A requirement is satisfied when the token holds every scope of at least one non-empty group.
+// Empty groups mean "no permission gates this" and are never treated as satisfied here, so
+// ungated items don't show up as enabled by the granted scopes.
+const hasSatisfiedGroup = (groups: ScopeGroupAlternatives, granted: Set<string>) =>
+  groups.some((group) => group.length > 0 && group.every((scope) => granted.has(scope)))
+
 /**
  * Given the set of granted scope ids, returns the Management API endpoints the token can call.
- * An endpoint is only enabled when ALL of its required scopes are granted (conjunctive), which is
- * how the mgmt-api `FgaPermissionsGuard` evaluates the `@AuthWithFgaPermissions` decorator.
+ * An endpoint is enabled when ALL scopes of at least ONE of its alternative groups are granted —
+ * the `x-fga-permissions` semantics (`AuthWithFgaPermissions` in the mgmt-api: the guard enforces
+ * the first group conjunctively; additional groups are alternatives checked in the handler).
  */
 export const getEnabledEndpoints = ({
   grantedScopes,
@@ -73,13 +90,13 @@ export const getEnabledEndpoints = ({
 
   const granted = new Set(grantedScopes)
   return Object.entries(permissionScopeMap.endpoints)
-    .filter(([, required]) => required.length > 0 && required.every((scope) => granted.has(scope)))
+    .filter(([, groups]) => hasSatisfiedGroup(groups, granted))
     .map(([raw]) => splitEndpoint(raw))
 }
 
 /**
  * Given the set of granted scope ids, returns the MCP tools the token can call. As with endpoints,
- * a tool is only enabled when ALL of its required scopes are granted.
+ * a tool is enabled when at least one of its alternative scope groups is fully granted.
  */
 export const getEnabledMcpTools = ({
   grantedScopes,
@@ -92,14 +109,14 @@ export const getEnabledMcpTools = ({
 
   const granted = new Set(grantedScopes)
   return Object.entries(permissionScopeMap.mcp_tools)
-    .filter(([, required]) => required.length > 0 && required.every((scope) => granted.has(scope)))
+    .filter(([, groups]) => hasSatisfiedGroup(groups, granted))
     .map(([tool]) => tool)
 }
 
 /**
- * Endpoints that (a) are fully satisfied by the complete granted-scope set AND (b) require at least
- * one of `capabilityScopes`. Used by the review step to group enabled endpoints under the capability
- * that contributes them, while still honouring dual-scope requirements (a dual-scope endpoint only
+ * Endpoints that are enabled by the complete granted-scope set AND owe that to `capabilityScopes`:
+ * some fully-granted group must contain at least one capability scope. Used by the review step to
+ * group enabled endpoints under the capability that contributes them (a multi-scope group only
  * appears once all its scopes are granted, and shows under each contributing capability).
  */
 export const getEnabledEndpointsForCapability = ({
@@ -116,11 +133,11 @@ export const getEnabledEndpointsForCapability = ({
   const granted = new Set(allGrantedScopes)
   const capability = new Set(capabilityScopes)
   return Object.entries(permissionScopeMap.endpoints)
-    .filter(
-      ([, required]) =>
-        required.length > 0 &&
-        required.every((scope) => granted.has(scope)) &&
-        required.some((scope) => capability.has(scope))
+    .filter(([, groups]) =>
+      hasSatisfiedGroup(
+        groups.filter((group) => group.some((scope) => capability.has(scope))),
+        granted
+      )
     )
     .map(([raw]) => splitEndpoint(raw))
 }

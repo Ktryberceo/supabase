@@ -12,7 +12,9 @@ import {
 } from '@/data/scoped-access-tokens/permission-scope-map-query'
 import { InternalServerError } from '@/lib/api/apiHelpers'
 
-// Default lodash merge does not correctly merge arrays so this custom merger fixes it
+// Default lodash merge does not correctly merge arrays so this custom merger fixes it.
+// Concat is safe here: v1 and v2 endpoint keys never collide, so the only arrays merged across
+// specs are a scope's endpoint lists, whose entries are distinct.
 function mergeArrays(objValue: unknown, srcValue: unknown) {
   if (Array.isArray(objValue) && Array.isArray(srcValue)) {
     return objValue.concat(srcValue)
@@ -24,22 +26,20 @@ function mergeArrays(objValue: unknown, srcValue: unknown) {
  * @throws InternalServerError when it can't fetch the OpenAPI specs
  */
 export const buildAPIPermissionScopeMap = async (): Promise<PermissionScopeMap> => {
-  // Get the permissions map for the API v1
-  const apiV1SpecsJSON = await fetchAPIPermissionScope('v1')
-  const apiV1Specs = API_SPECS_SCHEMA.parse(apiV1SpecsJSON)
-  const permissionScopeMapV1 = getEndpointsAndMCPToolsForAPI(apiV1Specs, MCPToolScopeMappings)
+  const [apiV1SpecsJSON, apiV2SpecsJSON] = await Promise.all([
+    fetchAPIPermissionScope('v1'),
+    fetchAPIPermissionScope('v2'),
+  ])
+  const permissionScopeMapV1 = getEndpointsForAPI(API_SPECS_SCHEMA.parse(apiV1SpecsJSON))
+  const permissionScopeMapV2 = getEndpointsForAPI(API_SPECS_SCHEMA.parse(apiV2SpecsJSON))
 
-  // Get the permissions map for the API v2
-  const apiV2SpecsJSON = await fetchAPIPermissionScope('v2')
-  const apiV2Specs = API_SPECS_SCHEMA.parse(apiV2SpecsJSON)
-  const permissionScopeMapV2 = getEndpointsAndMCPToolsForAPI(apiV2Specs, MCPToolScopeMappings)
-
-  const permissionScope = lodash.mergeWith(
+  const permissionScope: PermissionScopeMap = lodash.mergeWith(
     { mcp_tools: MCPToolScopeMappings },
     permissionScopeMapV1,
     permissionScopeMapV2,
     mergeArrays
   )
+  addMCPToolsToScopes(permissionScope.scopes, MCPToolScopeMappings)
 
   return permissionScope
 }
@@ -47,61 +47,63 @@ export const buildAPIPermissionScopeMap = async (): Promise<PermissionScopeMap> 
 // OPEN API specs look like this (only kept the parts we're interested in):
 // {
 //   "paths": {
-//     "/v2/projects/{ref}/analytics/log-drains": {
+//     "/v1/projects/{ref}/branches": {
 //       "get": {
 //         "x-fga-permissions": [
-//           [
-//             "analytics_config_read"
-//           ]
+//           ["branching_development_read"],
+//           ["branching_production_read"]
 //         ]
 //       }
 //     }
 //   }
 // }
-export const getEndpointsAndMCPToolsForAPI = (
-  apiSpecs: z.output<typeof API_SPECS_SCHEMA>,
-  mcp_tools: McpMap
+// The extension value is a list of alternative permission groups: a token needs ALL permissions
+// of at least ONE group (OR between groups, AND within a group) — see `AuthWithFgaPermissions`
+// in the mgmt-api. Groups must be preserved verbatim, not flattened, or OR-alternatives (e.g.
+// development vs production branching) turn into impossible conjunctions.
+export const getEndpointsForAPI = (
+  apiSpecs: z.output<typeof API_SPECS_SCHEMA>
 ): Omit<PermissionScopeMap, 'mcp_tools'> => {
   const scopes: ScopeMap = {}
   const endpoints: EndpointMap = {}
 
-  // Loop over each API path to assign endpoints to their scopes and
-  // scopes to their endpoints
+  // Loop over each API path to record endpoint permission groups and index scopes -> endpoints
   Object.entries(apiSpecs.paths).forEach(([path, methods]) => {
     // Loop over each API path method (get, post, etc.)
     Object.entries(methods).forEach(([method, methodSpecs]) => {
       const endpoint = `${method.toUpperCase()} ${path}`
-      if (methodSpecs['x-fga-permissions'] == null) return
+      const groups = (methodSpecs['x-fga-permissions'] ?? []).filter(
+        (group): group is string[] => Array.isArray(group) && group.length > 0
+      )
+      if (groups.length === 0) return
 
-      methodSpecs['x-fga-permissions'].forEach((permissions) => {
-        permissions?.forEach((permission) => {
-          // Initialize scope object if needed
-          scopes[permission] = scopes[permission] || { endpoints: [], mcp_tools: [] }
+      endpoints[endpoint] = groups
 
-          // Initialize endpoints array if needed
-          endpoints[endpoint] = endpoints[endpoint] || []
+      groups.flat().forEach((permission) => {
+        // Initialize scope object if needed
+        scopes[permission] = scopes[permission] || { endpoints: [], mcp_tools: [] }
 
-          if (!scopes[permission].endpoints.includes(endpoint)) {
-            scopes[permission].endpoints.push(endpoint)
-          }
-          if (!endpoints[endpoint].includes(permission)) {
-            endpoints[endpoint].push(permission)
-          }
-        })
+        if (!scopes[permission].endpoints.includes(endpoint)) {
+          scopes[permission].endpoints.push(endpoint)
+        }
       })
     })
   })
 
-  // Assign the mcp tools to their scopes
-  Object.entries(mcp_tools).forEach(([mcpTool, toolScopes]) => {
-    toolScopes.forEach((toolScope) => {
-      if (scopes[toolScope] && !scopes[toolScope].mcp_tools.includes(mcpTool)) {
+  return { scopes, endpoints }
+}
+
+// Assign the mcp tools to their scopes. Scopes referenced only by tools (no endpoint lists
+// them, e.g. project_snippets_read) are initialized here so they don't vanish from the map.
+export const addMCPToolsToScopes = (scopes: ScopeMap, mcp_tools: McpMap) => {
+  Object.entries(mcp_tools).forEach(([mcpTool, toolScopeGroups]) => {
+    toolScopeGroups.flat().forEach((toolScope) => {
+      scopes[toolScope] = scopes[toolScope] || { endpoints: [], mcp_tools: [] }
+      if (!scopes[toolScope].mcp_tools.includes(mcpTool)) {
         scopes[toolScope].mcp_tools.push(mcpTool)
       }
     })
   })
-
-  return { scopes, endpoints }
 }
 
 const NEXT_PUBLIC_API_DOMAIN = process.env.NEXT_PUBLIC_API_DOMAIN || 'https://api.supabase.com'

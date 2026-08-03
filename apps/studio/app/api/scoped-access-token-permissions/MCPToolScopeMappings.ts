@@ -1,39 +1,59 @@
 import { constants, permissions } from '@supabase/shared-types'
+import { mapValues, pickBy, uniq } from 'lodash'
 
 import { McpMap } from '@/data/scoped-access-tokens/permission-scope-map-query'
 
 const { OAuthScope } = constants
 
-// Manually extracted from platform mcp controller code
-const MCPToolOAuthScopeMapping = {
-  apply_migration: [OAuthScope.DATABASE_WRITE],
-  create_branch: [OAuthScope.ENVIRONMENT_WRITE],
-  create_project: [OAuthScope.PROJECTS_WRITE],
-  delete_branch: [OAuthScope.ENVIRONMENT_WRITE],
-  deploy_edge_function: [OAuthScope.EDGE_FUNCTIONS_WRITE],
-  execute_sql: [OAuthScope.DATABASE_READ, OAuthScope.DATABASE_WRITE],
-  generate_typescript_types: [OAuthScope.DATABASE_READ],
-  get_security_advisors: [OAuthScope.DATABASE_READ],
-  get_performance_advisors: [OAuthScope.DATABASE_READ],
-  get_edge_function: [OAuthScope.EDGE_FUNCTIONS_READ],
-  get_logs: [OAuthScope.ANALYTICS_READ],
-  get_organization: [OAuthScope.ORGANIZATIONS_READ],
-  get_project: [OAuthScope.PROJECTS_READ],
-  get_project_url: [OAuthScope.PROJECTS_READ],
-  get_publishable_keys: [OAuthScope.SECRETS_READ],
-  get_storage_config: [OAuthScope.STORAGE_READ],
-  list_branches: [OAuthScope.ENVIRONMENT_READ],
-  list_edge_functions: [OAuthScope.EDGE_FUNCTIONS_READ],
-  list_migrations: [OAuthScope.DATABASE_READ],
-  list_organizations: [OAuthScope.ORGANIZATIONS_READ],
-  list_projects: [OAuthScope.PROJECTS_READ],
-  list_storage_buckets: [OAuthScope.STORAGE_READ],
-  merge_branch: [OAuthScope.ENVIRONMENT_WRITE],
-  pause_project: [OAuthScope.PROJECTS_WRITE],
-  rebase_branch: [OAuthScope.ENVIRONMENT_WRITE],
-  reset_branch: [OAuthScope.ENVIRONMENT_WRITE],
-  restore_project: [OAuthScope.PROJECTS_WRITE],
-  update_storage_config: [OAuthScope.STORAGE_WRITE],
+// Manually extracted from the platform MCP controller (`assertMcpOAuthScope` calls in
+// mgmt-api routes/mcp/mcp.controller.ts) against @supabase/mcp-server-supabase's tool registry.
+// Each value is a list of alternative OAuth-scope groups with the same semantics as
+// `ScopeGroupAlternatives` (OR between groups, AND within a group).
+// An empty group (`[[]]`) marks a tool that no permission gates; such tools are kept here for
+// auditability against the platform controller but filtered out of the exported map.
+const MCPToolOAuthScopeMapping: Record<string, constants.OAuthScope[][]> = {
+  apply_migration: [[OAuthScope.DATABASE_WRITE]],
+  // Pure cost-confirmation hash, no platform call
+  confirm_cost: [[]],
+  create_branch: [[OAuthScope.ENVIRONMENT_WRITE]],
+  // create_project and get_cost are intentionally absent here: their handler authorization is
+  // narrower than any OAuth scope bundle, so they're mapped directly to FGA permissions in
+  // MCPToolFgaScopeMapping below.
+  delete_branch: [[OAuthScope.ENVIRONMENT_WRITE]],
+  deploy_edge_function: [[OAuthScope.EDGE_FUNCTIONS_WRITE]],
+  // Requires read OR write depending on the tool's read_only parameter
+  execute_sql: [[OAuthScope.DATABASE_READ], [OAuthScope.DATABASE_WRITE]],
+  generate_typescript_types: [[OAuthScope.DATABASE_READ]],
+  // Single tool with a `type` param covering both security and performance advisors
+  get_advisors: [[OAuthScope.DATABASE_READ]],
+  get_edge_function: [[OAuthScope.EDGE_FUNCTIONS_READ]],
+  get_logs: [[OAuthScope.ANALYTICS_READ]],
+  get_organization: [[OAuthScope.ORGANIZATIONS_READ]],
+  get_project: [[OAuthScope.PROJECTS_READ]],
+  get_project_url: [[OAuthScope.PROJECTS_READ]],
+  get_publishable_keys: [[OAuthScope.SECRETS_READ]],
+  // Platform does not assert this scope on the storage-config operations yet (fix pending on the
+  // platform side) — mapped to the intended scope, not current develop behavior
+  get_storage_config: [[OAuthScope.STORAGE_READ]],
+  list_branches: [[OAuthScope.ENVIRONMENT_READ]],
+  list_edge_functions: [[OAuthScope.EDGE_FUNCTIONS_READ]],
+  // Runs executeSql(read_only: true) under the hood
+  list_extensions: [[OAuthScope.DATABASE_READ]],
+  list_migrations: [[OAuthScope.DATABASE_READ]],
+  list_organizations: [[OAuthScope.ORGANIZATIONS_READ]],
+  list_projects: [[OAuthScope.PROJECTS_READ]],
+  list_storage_buckets: [[OAuthScope.STORAGE_READ]],
+  // Runs executeSql(read_only: true) under the hood
+  list_tables: [[OAuthScope.DATABASE_READ]],
+  merge_branch: [[OAuthScope.ENVIRONMENT_WRITE]],
+  pause_project: [[OAuthScope.PROJECTS_WRITE]],
+  rebase_branch: [[OAuthScope.ENVIRONMENT_WRITE]],
+  reset_branch: [[OAuthScope.ENVIRONMENT_WRITE]],
+  restore_project: [[OAuthScope.PROJECTS_WRITE]],
+  // Content API lookup, no platform authorization
+  search_docs: [[]],
+  // Same pending platform-side scope enforcement as get_storage_config
+  update_storage_config: [[OAuthScope.STORAGE_WRITE]],
 }
 
 type ExtractIds<T> = {
@@ -156,19 +176,40 @@ export const legacyOauthScopeToFgaPermissionMap: Record<string, string[]> = {
   ],
 }
 
+// Tools whose MCP-handler authorization is narrower than any legacy OAuth scope bundle, mapped
+// directly to the FGA permissions of the checks the handlers actually run. OAuth scope asserts
+// are no-ops for PATs, so expanding the bundles would demand unrelated permissions (members,
+// project-admin, network) and hide these tools from tokens that can actually use them.
+// - get_cost: getOrganization -> READ organizations (organization_admin_read); listProjects
+//   performs no permission check (results are only RLS-filtered)
+// - create_project: the cost flow's getOrganization plus CREATE projects at the organization
+//   level (organization_projects_create)
+const MCPToolFgaScopeMapping: McpMap = {
+  get_cost: [[FGA_PERMISSIONS.ORGANIZATION.ADMIN_READ]],
+  create_project: [
+    [FGA_PERMISSIONS.ORGANIZATION.ADMIN_READ, FGA_PERMISSIONS.ORGANIZATION.PROJECTS_CREATE],
+  ],
+}
+
 /*
- * Build a map of MCP tools/FGA permissions by mapping their OAuth Scopes to the FGA permissions:
+ * Build a map of MCP tools/FGA permissions by expanding each OAuth scope inside a group into the
+ * FGA permissions it implies, preserving the alternative-group structure:
  * {
- *    apply_migration: ["project_admin_write", ...]
+ *    execute_sql: [["database_read", ...], ["project_admin_write", "database_write", ...]]
  * }
+ * Ungated tools (empty groups) are dropped so consumers can assume every group is non-empty.
  * The code is duplicated from platform until we find a better way to share those mappings
  */
-export const MCPToolScopeMappings = Object.entries(MCPToolOAuthScopeMapping).reduce(
-  (acc, [mcpTool, oAuthScopes]) => {
-    acc[mcpTool] = oAuthScopes.flatMap(
-      (oAuthScope) => legacyOauthScopeToFgaPermissionMap[oAuthScope]
-    )
-    return acc
-  },
-  {} as McpMap
-)
+export const MCPToolScopeMappings: McpMap = {
+  ...pickBy(
+    mapValues(MCPToolOAuthScopeMapping, (oAuthScopeGroups) =>
+      oAuthScopeGroups
+        .filter((group) => group.length > 0)
+        .map((group) =>
+          uniq(group.flatMap((oAuthScope) => legacyOauthScopeToFgaPermissionMap[oAuthScope]))
+        )
+    ),
+    (groups) => groups.length > 0
+  ),
+  ...MCPToolFgaScopeMapping,
+}
